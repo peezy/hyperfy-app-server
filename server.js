@@ -547,7 +547,7 @@ class HyperfyAppServerHandler {
     this.server = server
     
     // File system properties moved from server
-    this.appsDir = path.join(process.cwd(), 'worlds/apps')
+    this.appsDir = path.join(process.cwd(), 'apps')
     this.hotReload = server.options.hotReload || process.env.HOT_RELOAD === 'true'
     this.fileWatchers = new Map() // appName -> file watcher
     this.pendingDeployments = new Map() // appName -> timeout for debouncing
@@ -993,15 +993,17 @@ class HyperfyAppServerHandler {
       
       const linksData = JSON.parse(fs.readFileSync(appLinksFile, 'utf8'))
       
-      // Find the blueprint for this app across all worlds
+      // Find the blueprint for this app across all worlds (resolve overrides first)
       for (const [worldUrl, worldData] of Object.entries(linksData)) {
         if (worldData.blueprints) {
-          const blueprint = worldData.blueprints.find(bp => bp.name === appName)
-          if (blueprint) {
-            return {
-              worldUrl,
-              blueprint,
-              assetsUrl: worldData.assetsUrl
+          for (const bp of worldData.blueprints) {
+            const resolved = this.resolveBlueprintWithDefaults(appName, bp)
+            if (resolved && resolved.name === appName) {
+              return {
+                worldUrl,
+                blueprint: resolved,
+                assetsUrl: worldData.assetsUrl
+              }
             }
           }
         }
@@ -1040,13 +1042,18 @@ class HyperfyAppServerHandler {
         }
       }
       
-      // Remove existing blueprint with same name (if any)
-      linksData[worldUrl].blueprints = linksData[worldUrl].blueprints.filter(
-        bp => bp.name !== appName
-      )
+      // Compute minimal overrides against defaults and always carry id/version
+      const minimalBlueprint = this.computeBlueprintOverrides(appName, blueprint)
+
+      // Remove existing blueprint matching by id or resolved name
+      linksData[worldUrl].blueprints = linksData[worldUrl].blueprints.filter((bp) => {
+        const sameId = bp.id && minimalBlueprint.id && bp.id === minimalBlueprint.id
+        const resolvedName = this.resolveBlueprintWithDefaults(appName, bp).name
+        return !sameId && resolvedName !== appName
+      })
       
-      // Add the new blueprint
-      linksData[worldUrl].blueprints.push(blueprint)
+      // Add the minimal blueprint overrides
+      linksData[worldUrl].blueprints.push(minimalBlueprint)
       
       // Write the updated structure
       fs.writeFileSync(appLinksFile, JSON.stringify(linksData, null, 2))
@@ -1072,9 +1079,10 @@ class HyperfyAppServerHandler {
       for (const [worldUrl, worldData] of Object.entries(linksData)) {
         if (worldData.blueprints) {
           const originalLength = worldData.blueprints.length
-          worldData.blueprints = worldData.blueprints.filter(
-            bp => bp.name !== appName
-          )
+          worldData.blueprints = worldData.blueprints.filter((bp) => {
+            const resolvedName = this.resolveBlueprintWithDefaults(appName, bp).name
+            return resolvedName !== appName
+          })
           if (worldData.blueprints.length !== originalLength) {
             modified = true
           }
@@ -1118,7 +1126,7 @@ class HyperfyAppServerHandler {
         if (fs.existsSync(scriptPath)) {
           const script = fs.readFileSync(scriptPath, 'utf8')
           
-          // Get config from links.json blueprint, else unlinked defaults, else minimal
+          // Get config from resolved links.json blueprint, else unlinked defaults, else minimal
           const config = linkInfo?.blueprint ? {
             name: linkInfo.blueprint.name,
             model: linkInfo.blueprint.model,
@@ -1238,6 +1246,66 @@ class HyperfyAppServerHandler {
     return cfg
   }
 
+  // Merge defaults from blueprint.json with overrides stored in links.json
+  resolveBlueprintWithDefaults(appName, blueprintFromLinks) {
+    const defaults = this.loadUnlinkedBlueprintDefaults(appName) || {}
+    const { id, version, script, ...overrides } = blueprintFromLinks || {}
+    const merged = { ...defaults, ...overrides }
+    // Ensure required fields
+    if (!merged.name) merged.name = appName
+    if (id) merged.id = id
+    if (typeof version !== 'undefined') merged.version = version
+    return merged
+  }
+
+  // Shallow-deep equality using JSON serialization (sufficient for plain data)
+  areDeepEqual(a, b) {
+    try {
+      return JSON.stringify(a) === JSON.stringify(b)
+    } catch (_) {
+      return a === b
+    }
+  }
+
+  // Compute minimal overrides compared to defaults from blueprint.json
+  computeBlueprintOverrides(appName, fullBlueprint) {
+    const defaults = this.loadUnlinkedBlueprintDefaults(appName) || {}
+    const keysToCompare = [
+      'name',
+      'model',
+      'props',
+      'script',
+      'image',
+      'author',
+      'url',
+      'desc',
+      'preload',
+      'public',
+      'locked',
+      'unique',
+      'disabled'
+    ]
+
+    const overrides = {}
+    for (const key of keysToCompare) {
+      if (Object.prototype.hasOwnProperty.call(fullBlueprint, key)) {
+        const value = fullBlueprint[key]
+        const defaultValue = defaults[key]
+        if (!this.areDeepEqual(value, defaultValue)) {
+          overrides[key] = value
+        }
+      }
+    }
+
+    // Always keep linkage metadata
+    if (fullBlueprint.id) overrides.id = fullBlueprint.id
+    if (Object.prototype.hasOwnProperty.call(fullBlueprint, 'version')) {
+      overrides.version = fullBlueprint.version
+    }
+
+    return overrides
+  }
+
   loadApp(appName) {
     const appPath = path.join(this.appsDir, appName)
     const scriptPath = path.join(appPath, 'index.js')
@@ -1249,7 +1317,7 @@ class HyperfyAppServerHandler {
     const linkInfo = this.getAppLinkInfo(appName)
     const script = fs.readFileSync(scriptPath, 'utf8')
 
-    // Get config from links.json blueprint, else unlinked defaults, else minimal
+    // Get config from resolved links.json blueprint, else unlinked defaults, else minimal
     const config = linkInfo?.blueprint ? {
       name: linkInfo.blueprint.name,
       model: linkInfo.blueprint.model,
@@ -1341,6 +1409,33 @@ app.on('click', () => {
         fs.writeFileSync(scriptPath, scriptContent, 'utf8')
       }
       
+      // Generate a blueprint.json so unlinked defaults can be loaded later
+      // Only create if it does not already exist
+      const manifestPath = path.join(appPath, 'blueprint.json')
+      if (!fs.existsSync(manifestPath)) {
+        const manifest = {
+          name: blueprint.name || appName,
+          // Keep asset:// URLs as-is; downloader will populate assets folder
+          model: blueprint.model || "",
+          props: blueprint.props || {},
+          image: blueprint.image || null,
+          author: blueprint.author || null,
+          url: blueprint.url || null,
+          desc: blueprint.desc || null,
+          preload: blueprint.preload || false,
+          public: blueprint.public || false,
+          locked: blueprint.locked || false,
+          unique: blueprint.unique || false,
+          disabled: blueprint.disabled || false,
+        }
+        // Remove undefined fields for cleanliness
+        const cleaned = Object.fromEntries(
+          Object.entries(manifest).filter(([, v]) => v !== undefined)
+        )
+        fs.writeFileSync(manifestPath, JSON.stringify(cleaned, null, 2), 'utf8')
+        console.log(`   💾 Wrote ${appName}/blueprint.json for defaults`)
+      }
+
       // Note: Config data is now stored in links.json, not in a separate config.json
       // The blueprint data will be saved when saveAppLinkInfo is called
       
@@ -1469,8 +1564,11 @@ app.on('click', () => {
     // Create initial app structure directly from blueprint data
     this.createAppFromBlueprint(appName, linkInfo.blueprint)
 
-    // Save the link info to the app's links.json file
-    this.saveAppLinkInfo(appName, linkInfo)
+    // Save the link info to the app's links.json file (store minimal overrides)
+    this.saveAppLinkInfo(appName, {
+      ...linkInfo,
+      blueprint: this.resolveBlueprintWithDefaults(appName, linkInfo.blueprint)
+    })
 
     // Download assets for this app via WebSocket if connection exists
     const ws = this.server.clients.get(linkInfo.worldUrl)
@@ -1933,20 +2031,24 @@ app.on('click', () => {
       const appPath = path.join(this.appsDir, appName)
       fs.mkdirSync(appPath, { recursive: true })
       
-      // Get existing link info
+      // Get existing link info (resolved blueprint)
       const existingLinkInfo = this.getAppLinkInfo(appName)
       
       if (existingLinkInfo) {
         // Update the blueprint in the existing link structure
+        const updatedResolved = this.resolveBlueprintWithDefaults(appName, {
+          ...blueprint,
+          id: existingLinkInfo.blueprint.id
+        })
         const updatedLinkInfo = {
           ...existingLinkInfo,
-          blueprint: blueprint
+          blueprint: updatedResolved
         }
         
         // Mark pending update to ignore file watcher
         this.markPendingUpdate(appName, { links: true })
         
-        // Save the updated link info
+        // Save the updated link info (minimal overrides)
         this.saveAppLinkInfo(appName, updatedLinkInfo)
         
         // Clear pending update after a delay
@@ -2300,19 +2402,19 @@ app.on('click', () => {
       }
       
       // Update the local blueprint with client data
+      const updatedResolved = this.resolveBlueprintWithDefaults(appName, {
+        ...clientBlueprint,
+        id: linkInfo.blueprint.id
+      })
       const updatedLinkInfo = {
         ...linkInfo,
-        blueprint: {
-          ...clientBlueprint,
-          // Preserve essential linking data
-          id: linkInfo.blueprint.id
-        }
+        blueprint: updatedResolved
       }
       
       // Mark pending update to ignore file watcher for links
       this.markPendingUpdate(appName, { links: true })
       
-      // Save the updated link info
+      // Save the updated link info (minimal overrides)
       this.saveAppLinkInfo(appName, updatedLinkInfo)
       
       // Clear pending updates and source tracking after a delay

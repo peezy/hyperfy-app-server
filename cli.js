@@ -4,8 +4,6 @@ import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 import { fileURLToPath } from 'url'
-import WebSocket from 'ws'
-import { Packr } from 'msgpackr'
 import readline from 'readline'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -14,9 +12,7 @@ const __dirname = path.dirname(__filename)
 class HyperfyCLI {
   constructor() {
     this.apiUrl = process.env.HYPERFY_APP_SERVER_URL || 'http://localhost:8080'
-    this.appsDir = path.join(process.cwd(), 'worlds/apps')
-    this.linksFile = path.join(process.cwd(), 'worlds/world-links.json')
-    this.worldConnections = new Map()
+    this.appsDir = path.join(process.cwd(), 'apps')
   }
 
   async validate(appName) {
@@ -238,244 +234,12 @@ class HyperfyCLI {
       console.log(`  Connected Clients: ${data.connectedClients}`)
       console.log(`  Timestamp: ${data.timestamp}`)
       console.log(`  Server URL: ${this.apiUrl}`)
-      
-      // Show linked worlds
-      const links = this.loadLinks()
-      if (Object.keys(links).length > 0) {
-        console.log(`\n🔗 Linked Apps:`)
-        for (const [appName, linkInfo] of Object.entries(links)) {
-          console.log(`  • ${appName} → ${linkInfo.worldUrl} (${linkInfo.appId})`)
-        }
-      }
     } catch (error) {
       console.error(`❌ App server not reachable: ${error.message}`)
       console.error(`💡 Start the server with: npm run dev`)
     }
   }
 
-  loadLinks() {
-    try {
-      if (fs.existsSync(this.linksFile)) {
-        return JSON.parse(fs.readFileSync(this.linksFile, 'utf8'))
-      }
-    } catch (error) {
-      console.error(`⚠️  Error loading links: ${error.message}`)
-    }
-    return {}
-  }
-
-  saveLinks(links) {
-    try {
-      fs.writeFileSync(this.linksFile, JSON.stringify(links, null, 2))
-    } catch (error) {
-      console.error(`❌ Error saving links: ${error.message}`)
-    }
-  }
-
-  async getWorldApps(worldUrl) {
-    return new Promise((resolve, reject) => {
-      console.log(`🌍 Connecting to world: ${worldUrl}`)
-      
-      // WebSocket imported at top level
-      const ws = new WebSocket(worldUrl)
-      
-      let worldData = null
-      
-      ws.on('open', () => {
-        console.log(`✅ Connected to world`)
-      })
-      
-      ws.on('message', (data) => {
-        try {
-          const [method, payload] = this.readPacket(data)
-          
-          if (method === 'snapshot') {
-            worldData = payload
-            console.log(`📊 Received world snapshot`)
-            console.log(`  • ${payload.blueprints.length} blueprints`)
-            console.log(`  • ${payload.entities.length} entities`)
-            
-            // Filter for app entities
-            const apps = payload.entities
-              .filter(entity => entity.type === 'app')
-              .map(entity => {
-                const blueprint = payload.blueprints.find(bp => bp.id === entity.blueprint)
-                return {
-                  id: entity.id,
-                  blueprintId: entity.blueprint,
-                  name: blueprint?.name || 'Unnamed App',
-                  script: blueprint?.script || null,
-                  model: blueprint?.model || null,
-                  position: entity.position,
-                  uploader: entity.uploader
-                }
-              })
-            
-            ws.close()
-            resolve({ worldData: payload, apps })
-          }
-        } catch (error) {
-          console.error(`❌ Error parsing world message: ${error.message}`)
-        }
-      })
-      
-      ws.on('error', (error) => {
-        console.error(`❌ World connection error: ${error.message}`)
-        reject(error)
-      })
-      
-      ws.on('close', () => {
-        if (!worldData) {
-          reject(new Error('Connection closed before receiving world data'))
-        }
-      })
-      
-      // Timeout after 10 seconds
-      setTimeout(() => {
-        if (ws.readyState !== WebSocket.CLOSED) {
-          ws.close()
-          reject(new Error('Connection timeout'))
-        }
-      }, 10000)
-    })
-  }
-
-  readPacket(data) {
-    // Use the same packet format as Hyperfy (msgpackr)
-    try {
-      // Packr imported at top level
-      const packr = new Packr({ structuredClone: true })
-      
-      // Packet format: [packetId, payload]
-      const [id, payload] = packr.unpack(data)
-      
-      // Map packet IDs to method names (from Hyperfy's packets.js)
-      const packetNames = [
-        'snapshot', 'command', 'chatAdded', 'chatCleared',
-        'blueprintAdded', 'blueprintModified', 'entityAdded', 'entityModified',
-        'entityEvent', 'entityRemoved', 'playerTeleport', 'playerPush',
-        'playerSessionAvatar', 'liveKitLevel', 'mute', 'settingsModified',
-        'spawnModified', 'modifyRank', 'kick', 'ping', 'pong'
-      ]
-      
-      const methodName = packetNames[id]
-      if (!methodName) {
-        console.warn(`Unknown packet ID: ${id}`)
-        return ['unknown', payload]
-      }
-      
-      return [methodName, payload]
-    } catch (error) {
-      console.error(`Error reading packet: ${error.message}`)
-      return ['error', null]
-    }
-  }
-
-  async linkApp(appName, worldUrl) {
-    try {
-      console.log(`🔗 Linking app ${appName} to world...`)
-      
-      const { apps } = await this.getWorldApps(worldUrl)
-      
-      if (apps.length === 0) {
-        console.log(`📭 No apps found in world`)
-        return
-      }
-      
-      console.log(`\n📱 Found ${apps.length} app(s) in world:`)
-      apps.forEach((app, index) => {
-        console.log(`  ${index + 1}. ${app.name} (${app.id})`)
-        if (app.uploader) console.log(`     Uploaded by: ${app.uploader}`)
-        if (app.position) console.log(`     Position: [${app.position.join(', ')}]`)
-      })
-      
-      // For now, auto-link to first app with matching name, or prompt user
-      let targetApp = apps.find(app => app.name.toLowerCase().includes(appName.toLowerCase()))
-      
-      if (!targetApp && apps.length === 1) {
-        targetApp = apps[0]
-        console.log(`\n🎯 Auto-linking to only app: ${targetApp.name}`)
-      } else if (!targetApp) {
-        console.log(`\n❓ Multiple apps found. Please specify which one to link to.`)
-        console.log(`💡 Use: hyperfy link ${appName} <worldUrl> --app-id <appId>`)
-        return
-      }
-      
-      // Save link
-      const links = this.loadLinks()
-      links[appName] = {
-        worldUrl,
-        appId: targetApp.id,
-        blueprintId: targetApp.blueprintId,
-        appName: targetApp.name,
-        linkedAt: new Date().toISOString()
-      }
-      this.saveLinks(links)
-      
-      console.log(`✅ Linked ${appName} to ${targetApp.name} in world`)
-      console.log(`🚀 Now you can deploy with: hyperfy deploy ${appName}`)
-      
-    } catch (error) {
-      console.error(`❌ Error linking app: ${error.message}`)
-    }
-  }
-
-  async deployLinked(appName, worldName) {
-    try {
-      const links = this.loadLinks()
-      
-      // Find linked app
-      let linkInfo = links[appName]
-      
-      if (!linkInfo) {
-        console.error(`❌ App ${appName} is not linked to any world`)
-        console.log(`💡 Link it first with: hyperfy link ${appName} <worldUrl>`)
-        return
-      }
-      
-      // If worldName specified, verify it matches
-      if (worldName && !linkInfo.worldUrl.includes(worldName)) {
-        console.error(`❌ App ${appName} is not linked to world ${worldName}`)
-        console.log(`🔗 Currently linked to: ${linkInfo.worldUrl}`)
-        return
-      }
-      
-      // Load local app
-      const app = this.loadApp(appName)
-      if (!app) {
-        console.error(`❌ Local app ${appName} not found`)
-        return
-      }
-      
-      console.log(`🚀 Deploying ${appName} to linked world...`)
-      console.log(`🌍 World: ${linkInfo.worldUrl}`)
-      console.log(`🎯 Target App: ${linkInfo.appName} (${linkInfo.appId})`)
-      
-      // Deploy via app server (which will use client connection)
-      const response = await fetch(`${this.apiUrl}/api/apps/${appName}/deploy-linked`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          linkInfo,
-          script: app.script,
-          config: app.config
-        })
-      })
-      
-      const data = await response.json()
-      
-      if (data.success) {
-        console.log(`✅ Successfully deployed to linked world!`)
-      } else {
-        console.error(`❌ Deploy failed: ${data.error}`)
-      }
-      
-    } catch (error) {
-      console.error(`❌ Error deploying linked app: ${error.message}`)
-    }
-  }
 
   async reset(options = {}) {
     const force = options.force || false
@@ -483,8 +247,7 @@ class HyperfyCLI {
     if (!force) {
       console.log(`⚠️  This will permanently delete:`)
       console.log(`   • All local apps in ${this.appsDir}`)
-      console.log(`   • All world links in ${this.linksFile}`)
-      console.log(`   • All server state (connections, snapshots)`)
+      console.log(`   • All server state`)
       console.log(``)
       
       // Simple confirmation without external dependencies
@@ -549,13 +312,6 @@ class HyperfyCLI {
       fs.rmSync(this.appsDir, { recursive: true, force: true })
       console.log(`✅ Local apps cleared`)
     }
-    
-    // Clear links file
-    if (fs.existsSync(this.linksFile)) {
-      console.log(`🗑️  Clearing world links...`)
-      fs.unlinkSync(this.linksFile)
-      console.log(`✅ World links cleared`)
-    }
   }
 
   loadApp(appName) {
@@ -587,28 +343,25 @@ Usage:
 Commands:
   create <appName>           Create a new app
   list                       List all local apps
-  deploy <appName> [world]   Deploy app to linked world
+  deploy <appName>           Deploy app to connected clients
   update <appName>           Update app script  
-  link <appName> <worldUrl>  Link local app to world app
   validate <appName>         Verify index.js matches config.json script hash
-  reset [--force]            Reset all apps, links, and server state
+  reset [--force]            Reset all apps and server state
   status                     Show app server status
   help                       Show this help
 
 Examples:
   hyperfy create myGame
-  hyperfy link myGame wss://myworld.hyperfy.io/ws
   hyperfy deploy myGame
-  hyperfy deploy myGame myworld
   hyperfy validate myGame
   hyperfy reset
   hyperfy reset --force
   hyperfy list
 
 Workflow:
-  1. Create or link to existing world app
+  1. Create an app locally
   2. Develop locally with hot reload
-  3. Deploy updates to linked world
+  3. Deploy updates to connected clients
 
 Environment:
   HYPERFY_APP_SERVER_URL   App server URL (default: http://localhost:8080)
@@ -634,16 +387,10 @@ async function main() {
     case 'deploy':
       if (!args[0]) {
         console.error('❌ App name required')
-        console.log('Usage: hyperfy deploy <appName> [worldName]')
+        console.log('Usage: hyperfy deploy <appName>')
         break
       }
-      // Check if app is linked, if so use linked deployment
-      const links = cli.loadLinks()
-      if (links[args[0]]) {
-        await cli.deployLinked(args[0], args[1])
-      } else {
-        await cli.deploy(args[0])
-      }
+      await cli.deploy(args[0])
       break
 
     case 'update':
@@ -660,16 +407,6 @@ async function main() {
       break
 
 
-
-    case 'link':
-      if (!args[0] || !args[1]) {
-        console.error('❌ App name and world URL required')
-        console.log('Usage: hyperfy link <appName> <worldUrl>')
-        console.log('Example: hyperfy link myGame wss://myworld.hyperfy.io/ws')
-        break
-      }
-      await cli.linkApp(args[0], args[1])
-      break
 
     case 'validate':
       if (!args[0]) {
