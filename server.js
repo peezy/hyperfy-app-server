@@ -548,7 +548,14 @@ class HyperfyAppServerHandler {
     
     // File system properties moved from server
     this.appsDir = path.join(process.cwd(), 'apps')
-    this.hotReload = server.options.hotReload || process.env.HOT_RELOAD === 'true'
+    // Prefer explicit option; else env var (truthy unless 'false'/'0'); default to true
+    if (typeof server.options.hotReload === 'boolean') {
+      this.hotReload = server.options.hotReload
+    } else if (typeof process.env.HOT_RELOAD !== 'undefined') {
+      this.hotReload = process.env.HOT_RELOAD !== 'false' && process.env.HOT_RELOAD !== '0'
+    } else {
+      this.hotReload = true
+    }
     this.fileWatchers = new Map() // appName -> file watcher
     this.pendingDeployments = new Map() // appName -> timeout for debouncing
     
@@ -2479,8 +2486,22 @@ async function main({port, ...options}) {
 
 // Only start the server if this file is run directly (not imported)
 if (import.meta.url === `file://${process.argv[1]}`) {
+  // Default hot reload ON unless explicitly disabled
+  const argv = process.argv.slice(2)
+  const noHot = argv.includes('--no-hot-reload')
+  const yesHot = argv.includes('--hot-reload')
+  let hotReload
+  if (noHot) {
+    hotReload = false
+  } else if (yesHot) {
+    hotReload = true
+  } else if (typeof process.env.HOT_RELOAD !== 'undefined') {
+    hotReload = process.env.HOT_RELOAD !== 'false' && process.env.HOT_RELOAD !== '0'
+  } else {
+    hotReload = true
+  }
   const options = {
-    hotReload: process.env.HOT_RELOAD === 'true' || process.argv.includes('--hot-reload'),
+    hotReload,
     port: process.env.PORT || 8080
   }
   main(options)
