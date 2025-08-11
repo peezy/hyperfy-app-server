@@ -1585,24 +1585,59 @@ class HyperfyAppServerHandler {
 
     // Create index.js with provided script or default
     const { script, ...configData } = appData
-    const scriptContent = script || `// ${appName} App
-// This app was created with Hyperfy dev tools
+    const scriptContent = script || `// scripts exist inside apps, which are isolated from eachother but can communicate
+// global variables: Vector3, Quaternion, Matrix4, Euler, fetch, num(min, max) (similar to Math.random)
 
-console.log('${appName} app loaded!')
+// exposes variables to the UI (docs/scripting/app/Props.md)
+app.configure([
+  {
+    type: "text",
+    key: "color",
+    label: "Box Color",
+    placeholder: "Enter a hex color",
+    initial: "#ff0000",
+  },
+]);
 
-// App lifecycle hooks
-app.on('start', () => {
-  console.log('${appName} started')
-})
+// create nodes (docs/scripting/nodes/types/**.md)
+const group = app.create("group");
+const box = app.create("prim", {
+  type: "box",
+  scale: [2, 1, 3],
+  position: [0, 1, 0],
+  color: props.color,
+});
+group.add(box);
+app.add(group); // add to world space with world.add(group)
 
-app.on('destroy', () => {
-  console.log('${appName} destroyed')
-})
+// networking (docs/scripting/Networking.md)
+if (world.isServer) {
+  app.on("ping", () => {
+    console.log("ping heard on server of original app");
+    app.emit("cross-app-ping", {});
+  });
+  world.on("cross-app-pong", () => {
+    app.send("end", {});
+  });
+}
 
-// Example: respond to clicks
-app.on('click', () => {
-  console.log('${appName} was clicked!')
-})
+if (world.isClient) {
+  // get player objects (docs/scripting/world/World.md)
+  const localPlayer = world.getPlayer();
+  world.on('enter', (player) => {
+    console.log('player entered', player.playerId)
+  })
+  // client-side code
+  app.on("end", () => {
+    console.log("full loop ended");
+  });
+  app.send("ping", {});
+}
+
+app.on("update", (delta) => {
+  // runs on both client and server
+  // 'fixedUpdate' is better for physics
+});
 `
     fs.writeFileSync(path.join(appPath, 'index.js'), scriptContent)
 
