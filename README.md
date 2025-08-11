@@ -1,4 +1,4 @@
-## @drama-haus/app-server
+## @drama.haus/app-server
 
 Hyperfy app development server and CLI. Spin up a local HTTP/WebSocket server to build, link, and hot‑reload Hyperfy apps from your filesystem. Includes a small CLI for common workflows.
 
@@ -7,8 +7,8 @@ Hyperfy app development server and CLI. Spin up a local HTTP/WebSocket server to
 ### Using npx
 
 ```bash
-npx @drama-haus/app-server           # starts the server (hot reload ON by default)
-npx @drama-haus/app-server list      # runs the CLI 'list' command
+npx @drama.haus/app-server           # starts the server (hot reload ON by default)
+npx @drama.haus/app-server list      # runs the CLI 'list' command
 ```
 
 ### Local dev
@@ -30,19 +30,19 @@ Server starts on `http://localhost:8080` and WebSocket on `ws://localhost:8080/`
 
 - Run ad‑hoc with npx (no install):
   ```bash
-  npx @drama-haus/app-server
+  npx @drama.haus/app-server
   ```
 - Install on your local
 
 ```bash
 # inside your existing project
-npm i -D @drama-haus/app-server
+npm i -D @drama.haus/app-server
 
 # add an npm script in your project's package.json
 # {
 #   "scripts": {
-#     "hyperfy:server": "npx @drama-haus/app-server",
-#     "hyperfy:server:nohot": "npx @drama-haus/app-server --no-hot-reload"
+#     "hyperfy:server": "npx @drama.haus/app-server",
+#     "hyperfy:server:nohot": "npx @drama.haus/app-server --no-hot-reload"
 #   }
 # }
 
@@ -68,8 +68,8 @@ Disable/enable:
 
 Examples:
 ```bash
-npx @drama-haus/app-server --no-hot-reload
-HOT_RELOAD=false npx @drama-haus/app-server
+npx @drama.haus/app-server --no-hot-reload
+HOT_RELOAD=false npx @drama.haus/app-server
 ```
 
 ---
@@ -94,13 +94,13 @@ The server stores only minimal blueprint overrides in `links.json`, computed aga
 Run via npx or the installed binary. All commands talk to the local server at `HYPERFY_APP_SERVER_URL` (default `http://localhost:8080`).
 
 ```bash
-npx @drama-haus/app-server create <appName>
-npx @drama-haus/app-server list
-npx @drama-haus/app-server deploy <appName>
-npx @drama-haus/app-server update <appName> [scriptPath]
-npx @drama-haus/app-server validate <appName>
-npx @drama-haus/app-server reset [--force]
-npx @drama-haus/app-server status
+npx @drama.haus/app-server create <appName>
+npx @drama.haus/app-server list
+npx @drama.haus/app-server deploy <appName>
+npx @drama.haus/app-server update <appName> [scriptPath]
+npx @drama.haus/app-server validate <appName>
+npx @drama.haus/app-server reset [--force]
+npx @drama.haus/app-server status
 ```
 
 ### Environment
@@ -185,7 +185,7 @@ You can embed the server in your own tooling and implement the HTTP/WS behavior 
 
 ```js
 // dev-server.js (in your project)
-import { HyperfyAppServer } from '@drama-haus/app-server'
+import { HyperfyAppServer } from '@drama.haus/app-server'
 
 class MyServiceHandler {
   // HTTP routes
@@ -280,10 +280,10 @@ Note: The packaged default handler (`HyperfyAppServerHandler`) provides a robust
 
 ### Create and deploy an app
 ```bash
-npx @drama-haus/app-server                     # start server
-npx @drama-haus/app-server create myApp        # scaffold app
+npx @drama.haus/app-server                     # start server
+npx @drama.haus/app-server create myApp        # scaffold app
 # edit apps/myApp/index.js
-npx @drama-haus/app-server deploy myApp
+npx @drama.haus/app-server deploy myApp
 ```
 
 ### Link an existing blueprint via API
@@ -308,9 +308,9 @@ curl -X POST http://localhost:8080/api/apps/myApp/link \
 
 ### Disable hot reload
 ```bash
-npx @drama-haus/app-server --no-hot-reload
+npx @drama.haus/app-server --no-hot-reload
 # or
-HOT_RELOAD=false npx @drama-haus/app-server
+HOT_RELOAD=false npx @drama.haus/app-server
 ```
 
 ---

@@ -1,8 +1,10 @@
 {
-  "name": "@drama-haus/app-server",
-  "version": "0.0.1",
+  "name": "@drama.haus/app-server",
+  "version": "0.0.2",
   "type": "module",
-  "bin": "./bin.js",
+  "bin": {
+    "app-server": "bin.js"
+  },
   "exports": {
     ".": "./server.js"
   },
@@ -17,5 +19,8 @@
     "@fastify/websocket": "^11.2.0",
     "fastify": "^5.4.0",
     "nanoid": "^5.1.5"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

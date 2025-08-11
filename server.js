@@ -548,6 +548,9 @@ class HyperfyAppServerHandler {
     
     // File system properties moved from server
     this.appsDir = path.join(process.cwd(), 'apps')
+    this.centralAssetsDir = path.join(process.cwd(), 'assets')
+    this.assetMappingsCsvPath = path.join(process.cwd(), 'asset_mappings.csv')
+    this.assetMappings = new Map() // hash -> relative path (e.g., assets/empty.glb)
     // Prefer explicit option; else env var (truthy unless 'false'/'0'); default to true
     if (typeof server.options.hotReload === 'boolean') {
       this.hotReload = server.options.hotReload
@@ -573,6 +576,131 @@ class HyperfyAppServerHandler {
     this.attachHandlers()
   }
 
+  // --- Central assets helpers ---
+  sanitizeFileName(name) {
+    try {
+      const trimmed = (name || '').toString().trim()
+      // Replace disallowed characters, collapse whitespace
+      return trimmed
+        .replace(/[^a-zA-Z0-9._-]+/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '')
+    } catch (_) {
+      return 'file'
+    }
+  }
+
+  resolveCentralAssetFileName(suggestedBaseName, ext, targetHash) {
+    const base = this.sanitizeFileName(path.basename(suggestedBaseName, ext) || 'file')
+    let candidate = `${base}${ext}`
+    let index = 0
+
+    while (true) {
+      const rel = path.join('assets', candidate).replace(/\\/g, '/')
+      const abs = path.join(process.cwd(), rel)
+      if (!fs.existsSync(abs)) {
+        return { fileName: candidate, relPath: rel, absPath: abs }
+      }
+
+      // If exists, check hash; if same, reuse
+      const existingHash = hashFile(abs)
+      if (existingHash && existingHash === targetHash) {
+        return { fileName: candidate, relPath: rel, absPath: abs }
+      }
+
+      index += 1
+      candidate = `${base}_${index}${ext}`
+    }
+  }
+
+  ensureCentralAssetFromContent(content, loaderType, suggestedName, assetUrl) {
+    const isScript = loaderType === 'script'
+    const ext = path.extname(suggestedName || '.bin') || '.bin'
+    const hashFromUrl = extractHashFromAssetUrl(assetUrl)
+    const targetHash = hashFromUrl || (isScript ? crypto.createHash('sha256').update(content, 'utf8').digest('hex') : null)
+
+    // If we already know this hash mapping, reuse its path
+    if (targetHash && this.assetMappings.has(targetHash)) {
+      const rel = this.assetMappings.get(targetHash)
+      const abs = path.join(process.cwd(), rel)
+      // Ensure index is aware
+      this.assetHashIndex.set(`${targetHash}${ext.toLowerCase()}`, abs)
+      return { relPath: rel, absPath: abs, hash: targetHash }
+    }
+
+    const baseName = suggestedName && this.sanitizeFileName(suggestedName) || `file${ext}`
+    const { relPath, absPath } = this.resolveCentralAssetFileName(baseName, ext.toLowerCase(), targetHash || '')
+
+    // Write content
+    if (isScript) {
+      fs.writeFileSync(absPath, content, 'utf8')
+    } else {
+      const buffer = Buffer.from(content, 'base64')
+      fs.writeFileSync(absPath, buffer)
+    }
+
+    // Update mapping/index
+    const writtenHash = targetHash || hashFile(absPath)
+    if (writtenHash) {
+      this.updateAssetMappingForFile(absPath, relPath)
+      this.saveAssetMappingsCsv()
+    }
+
+    return { relPath, absPath, hash: writtenHash }
+  }
+
+  async applyBlueprintAssetPathUpdates(appName, updates) {
+    // updates: { model?: 'assets/...', props?: { [key]: 'assets/...' } }
+    try {
+      const appPath = path.join(this.appsDir, appName)
+      const manifestPath = path.join(appPath, 'blueprint.json')
+      let blueprint = {}
+      if (fs.existsSync(manifestPath)) {
+        try { blueprint = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) } catch (_) { blueprint = {} }
+      }
+
+      let changed = false
+      if (updates.model) {
+        if (blueprint.model !== updates.model) {
+          blueprint.model = updates.model
+          changed = true
+        }
+      }
+      if (updates.props) {
+        blueprint.props = blueprint.props && typeof blueprint.props === 'object' ? blueprint.props : {}
+        for (const [k, relPath] of Object.entries(updates.props)) {
+          const entry = blueprint.props[k] && typeof blueprint.props[k] === 'object' ? blueprint.props[k] : {}
+          if (entry.url !== relPath) {
+            entry.url = relPath
+            blueprint.props[k] = entry
+            changed = true
+          }
+        }
+      }
+
+      if (changed) {
+        fs.writeFileSync(manifestPath, JSON.stringify(blueprint, null, 2), 'utf8')
+        console.log(`   💾 Updated ${appName}/blueprint.json with central asset paths`)
+      }
+
+      // Also update links.json minimal overrides to reflect these paths for consistency
+      const existingLinkInfo = this.getAppLinkInfo(appName)
+      if (existingLinkInfo) {
+        const resolved = this.resolveBlueprintWithDefaults(appName, {
+          ...existingLinkInfo.blueprint,
+          ...(updates.model ? { model: updates.model } : {}),
+          ...(updates.props ? { props: { ...(existingLinkInfo.blueprint.props || {}), ...Object.fromEntries(Object.entries(updates.props).map(([k, v]) => [k, { ...(existingLinkInfo.blueprint.props?.[k] || {}), url: v }])) } } : {})
+        })
+        const updatedLinkInfo = { ...existingLinkInfo, blueprint: resolved }
+        this.markPendingUpdate(appName, { links: true })
+        this.saveAppLinkInfo(appName, updatedLinkInfo)
+        setTimeout(() => this.clearPendingUpdate(appName, { links: true }), 1000)
+      }
+    } catch (err) {
+      console.warn(`⚠️  Failed to update blueprint asset paths for ${appName}:`, err.message)
+    }
+  }
+
   async start() {
     this.initializeFileSystem()
     await this.server.start(this)
@@ -580,6 +708,7 @@ class HyperfyAppServerHandler {
 
   initializeFileSystem() {
     this.setupDirectories()
+    this.setupCentralAssets()
     
     if (this.hotReload) {
       this.setupFileWatching()
@@ -596,6 +725,95 @@ class HyperfyAppServerHandler {
     if (!fs.existsSync(this.appsDir)) {
       fs.mkdirSync(this.appsDir, { recursive: true })
       console.log(`📁 Created apps directory: ${this.appsDir}`)
+    }
+
+    // Create centralized assets directory
+    if (!fs.existsSync(this.centralAssetsDir)) {
+      fs.mkdirSync(this.centralAssetsDir, { recursive: true })
+      console.log(`📁 Created central assets directory: ${this.centralAssetsDir}`)
+    }
+  }
+
+  setupCentralAssets() {
+    try {
+      // Seed default empty.glb if present in The Grid assets
+      const gridAssetsDir = path.join(this.appsDir, 'The Grid', 'assets')
+      const centralEmptyGlb = path.join(this.centralAssetsDir, 'empty.glb')
+      if (!fs.existsSync(centralEmptyGlb) && fs.existsSync(gridAssetsDir)) {
+        const gridFiles = fs.readdirSync(gridAssetsDir, { withFileTypes: true })
+        const emptyGlb = gridFiles.find(f => f.isFile() && path.extname(f.name).toLowerCase() === '.glb')
+        if (emptyGlb) {
+          fs.copyFileSync(path.join(gridAssetsDir, emptyGlb.name), centralEmptyGlb)
+          console.log('   💾 Seeded central assets: empty.glb')
+        }
+      }
+
+      // Load any existing mappings from CSV, then rescan central assets to refresh
+      this.loadAssetMappingsCsv()
+      this.indexCentralAssets()
+      this.saveAssetMappingsCsv()
+    } catch (err) {
+      console.warn('⚠️  setupCentralAssets failed:', err.message)
+    }
+  }
+
+  loadAssetMappingsCsv() {
+    try {
+      if (!fs.existsSync(this.assetMappingsCsvPath)) return
+      const content = fs.readFileSync(this.assetMappingsCsvPath, 'utf8')
+      const lines = content.split(/\r?\n/).filter(Boolean)
+      for (const line of lines) {
+        // skip header
+        if (line.toLowerCase().startsWith('hash,')) continue
+        const [hash, relPath] = line.split(',')
+        if (!hash || !relPath) continue
+        this.assetMappings.set(hash, relPath)
+        const abs = path.join(process.cwd(), relPath)
+        const ext = path.extname(relPath).toLowerCase()
+        this.assetHashIndex.set(`${hash}${ext}`, abs)
+      }
+    } catch (err) {
+      console.warn('⚠️  Could not load asset_mappings.csv:', err.message)
+    }
+  }
+
+  saveAssetMappingsCsv() {
+    try {
+      const header = 'hash,relative_path\n'
+      const rows = []
+      for (const [hash, rel] of this.assetMappings.entries()) {
+        rows.push(`${hash},${rel}`)
+      }
+      fs.writeFileSync(this.assetMappingsCsvPath, header + rows.join('\n'), 'utf8')
+    } catch (err) {
+      console.warn('⚠️  Could not write asset_mappings.csv:', err.message)
+    }
+  }
+
+  updateAssetMappingForFile(absPath, relativePath) {
+    try {
+      const fileHash = hashFile(absPath)
+      if (!fileHash) return
+      const ext = path.extname(absPath).toLowerCase()
+      this.assetMappings.set(fileHash, relativePath)
+      this.assetHashIndex.set(`${fileHash}${ext}`, absPath)
+    } catch (err) {
+      console.warn('⚠️  updateAssetMappingForFile failed:', err.message)
+    }
+  }
+
+  indexCentralAssets() {
+    try {
+      if (!fs.existsSync(this.centralAssetsDir)) return
+      const entries = fs.readdirSync(this.centralAssetsDir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (!entry.isFile()) continue
+        const abs = path.join(this.centralAssetsDir, entry.name)
+        const rel = path.join('assets', entry.name).replace(/\\/g, '/')
+        this.updateAssetMappingForFile(abs, rel)
+      }
+    } catch (err) {
+      console.warn('⚠️  indexCentralAssets failed:', err.message)
     }
   }
 
@@ -1184,23 +1402,24 @@ class HyperfyAppServerHandler {
   }
 
   getAppAssets(appName) {
-    const assetsPath = path.join(this.appsDir, appName, 'assets')
-    if (!fs.existsSync(assetsPath)) return []
-
-    const assets = []
-    const files = fs.readdirSync(assetsPath, { withFileTypes: true })
-
-    for (const file of files) {
-      if (file.isFile()) {
-        assets.push({
-          name: file.name,
-          path: path.join('assets', file.name),
-          type: this.getAssetType(file.name)
-        })
+    // Derive assets from blueprint.json references (model + prop urls)
+    const referenced = []
+    try {
+      const manifestPath = path.join(this.appsDir, appName, 'blueprint.json')
+      if (!fs.existsSync(manifestPath)) return []
+      const bp = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+      if (bp.model && typeof bp.model === 'string' && bp.model.startsWith('assets/')) {
+        referenced.push({ name: path.basename(bp.model), path: bp.model, type: this.getAssetType(bp.model) })
       }
-    }
-
-    return assets
+      if (bp.props && typeof bp.props === 'object') {
+        for (const v of Object.values(bp.props)) {
+          if (v && typeof v === 'object' && typeof v.url === 'string' && v.url.startsWith('assets/')) {
+            referenced.push({ name: path.basename(v.url), path: v.url, type: this.getAssetType(v.url) })
+          }
+        }
+      }
+    } catch (_) {}
+    return referenced
   }
 
   // Load defaults from blueprint.json or inline block; returns normalized config
@@ -1229,13 +1448,22 @@ class HyperfyAppServerHandler {
       if (!p || typeof p !== 'string') return p
       if (p.startsWith('asset://')) return p
       if (!p.startsWith('assets/')) return p
-      const absPath = path.join(this.appsDir, appName, p)
+      // Prefer centralized assets, fallback to app-local assets
+      const centralAbsPath = path.join(process.cwd(), p)
+      const appLocalAbsPath = path.join(this.appsDir, appName, p)
+      const absPath = fs.existsSync(centralAbsPath) ? centralAbsPath : appLocalAbsPath
       if (!fs.existsSync(absPath)) return p
       const hash = hashFile(absPath)
       const ext = path.extname(p).toLowerCase()
       if (!hash) return p
       const key = `${hash}${ext}`
       this.assetHashIndex.set(key, absPath)
+      // Track mapping for centralized assets for reverse lookup on client events
+      const relPath = path.relative(process.cwd(), absPath).replace(/\\/g, '/')
+      if (relPath.startsWith('assets/')) {
+        this.assetMappings.set(hash, relPath)
+        this.saveAssetMappingsCsv()
+      }
       return `asset://${key}`
     }
 
@@ -1354,7 +1582,6 @@ class HyperfyAppServerHandler {
 
     // Create app directory structure
     fs.mkdirSync(appPath, { recursive: true })
-    fs.mkdirSync(path.join(appPath, 'assets'), { recursive: true })
 
     // Create index.js with provided script or default
     const { script, ...configData } = appData
@@ -1379,8 +1606,38 @@ app.on('click', () => {
 `
     fs.writeFileSync(path.join(appPath, 'index.js'), scriptContent)
 
-    // Note: Config data will be stored in links.json when the app is linked to a world
-    // For now, we don't create a separate config file
+    // Use centralized default empty model when available and scaffold blueprint.json
+    let defaultModelRelPath = null
+    try {
+      const centralEmptyGlb = path.join(this.centralAssetsDir, 'empty.glb')
+      if (fs.existsSync(centralEmptyGlb)) {
+        defaultModelRelPath = 'assets/empty.glb'
+        // Ensure it is indexed and mapped
+        this.updateAssetMappingForFile(centralEmptyGlb, defaultModelRelPath)
+        this.saveAssetMappingsCsv()
+      }
+    } catch (err) {
+      console.warn(`⚠️  Could not reference central default model for ${appName}:`, err.message)
+    }
+
+    // Create blueprint.json with sensible defaults so deployments have a model
+    try {
+      const manifestPath = path.join(appPath, 'blueprint.json')
+      if (!fs.existsSync(manifestPath)) {
+        const manifest = {
+          name: (appData && appData.name) || appName,
+          props: (appData && appData.props) || {}
+        }
+        if (defaultModelRelPath) {
+          manifest.model = defaultModelRelPath
+        }
+        const cleaned = Object.fromEntries(Object.entries(manifest).filter(([, v]) => v !== undefined))
+        fs.writeFileSync(manifestPath, JSON.stringify(cleaned, null, 2), 'utf8')
+        console.log(`   💾 Wrote ${appName}/blueprint.json${defaultModelRelPath ? ' with default model' : ''}`)
+      }
+    } catch (err) {
+      console.warn(`⚠️  Failed to write blueprint.json for ${appName}:`, err.message)
+    }
 
     // Start watching this app's script file if hot reload is enabled
     if (this.hotReload) {
@@ -1407,7 +1664,6 @@ app.on('click', () => {
       
       const appPath = path.join(this.appsDir, appName)
       fs.mkdirSync(appPath, { recursive: true })
-      fs.mkdirSync(path.join(appPath, 'assets'), { recursive: true })
 
       // Create a basic index.js if script is not an asset URL
       const scriptPath = path.join(appPath, 'index.js')
@@ -1473,10 +1729,14 @@ app.on('click', () => {
       // Add model asset if it exists
       if (blueprint.model && blueprint.model.startsWith('asset://')) {
         const assetType = this.getAssetTypeFromUrl(blueprint.model)
+        const ext = path.extname(blueprint.model)
+        const suggested = this.sanitizeFileName(`${appName}${ext}`)
         assetsToRequest.push({
           url: blueprint.model,
           type: assetType,
-          loaderType: this.getLoaderTypeFromAssetType(assetType)
+          loaderType: this.getLoaderTypeFromAssetType(assetType),
+          suggestedName: suggested,
+          propKey: null
         })
       }
 
@@ -1494,11 +1754,14 @@ app.on('click', () => {
         for (const [key, value] of Object.entries(blueprint.props)) {
           if (value && value.url && value.url.startsWith('asset://')) {
             const assetType = value.type || this.getAssetTypeFromUrl(value.url)
+            const ext = path.extname(value.url)
+            const suggested = this.sanitizeFileName((value.name && `${value.name}`) || `${key}${ext}`)
             assetsToRequest.push({
               url: value.url,
               type: assetType,
               loaderType: this.getLoaderTypeFromAssetType(assetType),
-              propKey: key
+              propKey: key,
+              suggestedName: suggested
             })
           }
         }
@@ -1511,10 +1774,6 @@ app.on('click', () => {
         return
       }
 
-      // Create assets directory
-      const appAssetsDir = path.join(this.appsDir, appName, 'assets')
-      fs.mkdirSync(appAssetsDir, { recursive: true })
-
       // Find the WebSocket connection for this world
       const ws = this.server.clients.get(linkInfo.worldUrl)
 
@@ -1522,31 +1781,34 @@ app.on('click', () => {
         console.log(`   📱 Found WebSocket connection for world ${linkInfo.worldUrl}, requesting assets from client`)
         
         // Request each asset from client
+        const updates = { props: {} }
         for (const asset of assetsToRequest) {
           try {
             console.log(`   📤 Requesting ${asset.type} asset from client: ${asset.url}`)
             const assetContent = await this.server.requestAssetFromClient(ws, asset.url, asset.loaderType)
             
             if (assetContent) {
-              // Save asset to local directory
-              const filename = path.basename(asset.url.replace('asset://', ''))
-              const targetPath = path.join(appAssetsDir, filename)
-              
-              if (asset.type === 'script') {
-                // Text content for scripts
-                fs.writeFileSync(targetPath, assetContent, 'utf8')
+              // Save into central assets with conflict-aware naming
+              const resolved = this.ensureCentralAssetFromContent(
+                assetContent,
+                asset.loaderType,
+                asset.suggestedName || path.basename(asset.url.replace('asset://', '')),
+                asset.url
+              )
+              if (asset.propKey) {
+                updates.props[asset.propKey] = resolved.relPath
               } else {
-                // Binary content for models, images, audio (base64 decoded)
-                const buffer = Buffer.from(assetContent, 'base64')
-                fs.writeFileSync(targetPath, buffer)
+                updates.model = resolved.relPath
               }
-              
-              console.log(`   ✅ Saved ${asset.type} asset from client: ${filename}`)
+              console.log(`   ✅ Saved ${asset.type} asset to central: ${path.basename(resolved.relPath)}`)
             }
           } catch (clientError) {
             console.warn(`   ⚠️  Failed to download ${asset.url}: ${clientError.message}`)
           }
         }
+
+        // Update blueprint defaults and link info with new central asset paths
+        await this.applyBlueprintAssetPathUpdates(appName, updates)
       } else {
         console.warn(`   ⚠️  No WebSocket connection found for world ${linkInfo.worldUrl}, skipping asset downloads`)
       }
@@ -2117,38 +2379,30 @@ app.on('click', () => {
       if (assetsToRequest.length > 0) {
         console.log(`   📦 Found ${assetsToRequest.length} new assets to request from client`)
         
-        // Create assets directory
-        const appAssetsDir = path.join(this.appsDir, appName, 'assets')
-        fs.mkdirSync(appAssetsDir, { recursive: true })
-        
         // Request each asset from client
-        for (const asset of assetsToRequest) {
+      const updates = { props: {} }
+      for (const asset of assetsToRequest) {
           try {
-            console.log(`   📤 Requesting ${asset.type} asset: ${asset.url}`)
-            const assetContent = await this.server.requestAssetFromClient(ws, asset.url, asset.loaderType)
-            
-            if (assetContent) {
-              // Save asset to local directory
-              const filename = path.basename(asset.url.replace('asset://', ''))
-              const targetPath = path.join(appAssetsDir, filename)
-              
-              if (asset.type === 'script') {
-                // Text content for scripts
-                fs.writeFileSync(targetPath, assetContent, 'utf8')
-              } else {
-                // Binary content for models, images, audio (base64 decoded)
-                const buffer = Buffer.from(assetContent, 'base64')
-                fs.writeFileSync(targetPath, buffer)
-              }
-              
-              console.log(`   ✅ Saved ${asset.type} asset: ${filename}`)
+          console.log(`   📤 Requesting ${asset.type} asset: ${asset.url}`)
+          const assetContent = await this.server.requestAssetFromClient(ws, asset.url, asset.loaderType)
+          if (assetContent) {
+            const suggested = asset.suggestedName || (asset.propKey ? `${asset.propKey}${path.extname(asset.url)}` : `${appName}${path.extname(asset.url)}`)
+            const resolved = this.ensureCentralAssetFromContent(assetContent, asset.loaderType, suggested, asset.url)
+            if (asset.propKey) {
+              updates.props[asset.propKey] = resolved.relPath
+            } else {
+              updates.model = resolved.relPath
             }
+            console.log(`   ✅ Saved ${asset.type} asset to central: ${path.basename(resolved.relPath)}`)
+          }
           } catch (clientError) {
             console.error(`   ❌ Failed to download asset ${asset.url}: ${clientError.message}`)
           }
         }
         
-        console.log(`   ✅ Processed all new assets for ${appName}`)
+      // Update blueprint defaults and links with central paths
+      await this.applyBlueprintAssetPathUpdates(appName, updates)
+      console.log(`   ✅ Processed all new assets for ${appName}`)
       } else {
         console.log(`   ⏭️  No new assets to process`)
       }
