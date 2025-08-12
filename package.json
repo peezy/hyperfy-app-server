@@ -1,6 +1,6 @@
 {
   "name": "@drama.haus/app-server",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "type": "module",
   "bin": {
     "app-server": "bin.js"
