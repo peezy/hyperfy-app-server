@@ -577,6 +577,40 @@ class HyperfyAppServerHandler {
   }
 
   // --- Central assets helpers ---
+  // Normalize an assets/ path to asset://<hash><ext> for a given app
+  // Keeps existing asset:// URLs as-is. Also updates in-memory indices/mappings.
+  normalizeAssetUrlForApp(appName, url) {
+    try {
+      if (!url || typeof url !== 'string') return url
+      if (url.startsWith('asset://')) return url
+      if (!url.startsWith('assets/')) return url
+
+      // Prefer centralized assets, fallback to app-local assets
+      const centralAbsPath = path.join(process.cwd(), url)
+      const appLocalAbsPath = path.join(this.appsDir, appName, url)
+      const absPath = fs.existsSync(centralAbsPath) ? centralAbsPath : appLocalAbsPath
+      if (!fs.existsSync(absPath)) return url
+
+      const hash = hashFile(absPath)
+      const ext = path.extname(url).toLowerCase()
+      if (!hash) return url
+
+      // Index for reverse lookup on client requests
+      const key = `${hash}${ext}`
+      this.assetHashIndex.set(key, absPath)
+
+      // Track mapping for centralized assets for reverse lookup
+      const relPath = path.relative(process.cwd(), absPath).replace(/\\/g, '/')
+      if (relPath.startsWith('assets/')) {
+        this.assetMappings.set(hash, relPath)
+        this.saveAssetMappingsCsv()
+      }
+
+      return `asset://${key}`
+    } catch (_) {
+      return url
+    }
+  }
   sanitizeFileName(name) {
     try {
       const trimmed = (name || '').toString().trim()
@@ -1484,7 +1518,27 @@ class HyperfyAppServerHandler {
   // Merge defaults from blueprint.json with overrides stored in links.json
   resolveBlueprintWithDefaults(appName, blueprintFromLinks) {
     const defaults = this.loadUnlinkedBlueprintDefaults(appName) || {}
-    const { id, version, script, ...overrides } = blueprintFromLinks || {}
+    const { id, version, ...rawOverrides } = blueprintFromLinks || {}
+
+    // Normalize any assets/... paths in overrides to asset://<hash>.<ext>
+    const overrides = { ...rawOverrides }
+    if (overrides.model && typeof overrides.model === 'string') {
+      overrides.model = this.normalizeAssetUrlForApp(appName, overrides.model)
+    }
+    if (overrides.script && typeof overrides.script === 'string') {
+      overrides.script = this.normalizeAssetUrlForApp(appName, overrides.script)
+    }
+    if (overrides.props && typeof overrides.props === 'object') {
+      for (const [key, value] of Object.entries(overrides.props)) {
+        if (value && typeof value === 'object' && typeof value.url === 'string') {
+          overrides.props[key] = {
+            ...value,
+            url: this.normalizeAssetUrlForApp(appName, value.url)
+          }
+        }
+      }
+    }
+
     const merged = { ...defaults, ...overrides }
     // Ensure required fields
     if (!merged.name) merged.name = appName
