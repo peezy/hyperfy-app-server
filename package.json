@@ -6,12 +6,17 @@
     "app-server": "bin.js"
   },
   "exports": {
-    ".": "./server.js"
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./server.js"
+    }
   },
   "description": "hyperfy app server",
   "main": "server.js",
+  "types": "index.d.ts",
   "scripts": {
-    "dev": "node server.js --hot-reload"
+    "dev": "node server.js --hot-reload",
+    "dev:ts": "node server.js --hot-reload --typescript"
   },
   "author": "peezy",
   "dependencies": {

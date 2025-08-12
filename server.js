@@ -559,6 +559,15 @@ class HyperfyAppServerHandler {
     } else {
       this.hotReload = true
     }
+    // TypeScript mode (default off)
+    if (typeof server.options.typescript === 'boolean') {
+      this.typescript = server.options.typescript
+    } else if (typeof process.env.TYPESCRIPT !== 'undefined') {
+      this.typescript = process.env.TYPESCRIPT === 'true' || process.env.TYPESCRIPT === '1'
+    } else {
+      this.typescript = false
+    }
+
     this.fileWatchers = new Map() // appName -> file watcher
     this.pendingDeployments = new Map() // appName -> timeout for debouncing
     
@@ -574,6 +583,25 @@ class HyperfyAppServerHandler {
     this.assetHashIndex = new Map()
     
     this.attachHandlers()
+  }
+
+  // --- Script helpers (JS/TS) ---
+  getAppScriptFilePath(appName) {
+    // Prefer TS when typescript mode is enabled and file exists
+    const tsPath = path.join(this.appsDir, appName, 'index.ts')
+    const jsPath = path.join(this.appsDir, appName, 'index.js')
+    if (this.typescript && fs.existsSync(tsPath)) return tsPath
+    if (fs.existsSync(jsPath)) return jsPath
+    // Fallback: if TS exists even when not in TS mode, use it
+    if (fs.existsSync(tsPath)) return tsPath
+    return this.typescript ? tsPath : jsPath
+  }
+
+  readAppScriptContent(appName) {
+    const scriptPath = this.getAppScriptFilePath(appName)
+    if (!fs.existsSync(scriptPath)) return ''
+    // We do not transpile TypeScript; scripts must be JS-compatible even if saved as .ts
+    return fs.readFileSync(scriptPath, 'utf8')
   }
 
   // --- Central assets helpers ---
@@ -750,6 +778,7 @@ class HyperfyAppServerHandler {
     
     console.log(`   Apps directory: ${this.appsDir}`)
     console.log(`   Hot reload: ${this.hotReload ? '✅ Enabled' : '❌ Disabled'}`)
+    console.log(`   TypeScript: ${this.typescript ? '✅ Enabled' : '❌ Disabled'}`)
   }
 
 
@@ -883,7 +912,7 @@ class HyperfyAppServerHandler {
   }
 
   watchAppScript(appName) {
-    const scriptPath = path.join(this.appsDir, appName, 'index.js')
+    const scriptPath = this.getAppScriptFilePath(appName)
     
     if (!fs.existsSync(scriptPath)) {
       return // No script file to watch yet
@@ -897,15 +926,15 @@ class HyperfyAppServerHandler {
     try {
       const watcher = fs.watch(scriptPath, (eventType) => {
         if (eventType === 'change') {
-          console.log(`📝 Detected change in ${appName}/index.js`)
+          console.log(`📝 Detected change in ${appName}/${path.basename(scriptPath)}`)
           this.handleScriptFileChange(appName)
         }
       })
       
       this.fileWatchers.set(appName + '-script', watcher)
-      console.log(`   👀 Watching ${appName}/index.js for changes`)
+      console.log(`   👀 Watching ${appName}/${path.basename(scriptPath)} for changes`)
     } catch (error) {
-      console.warn(`⚠️  Failed to watch ${appName}/index.js:`, error.message)
+      console.warn(`⚠️  Failed to watch ${appName}/${path.basename(scriptPath)}:`, error.message)
     }
   }
 
@@ -1017,9 +1046,8 @@ class HyperfyAppServerHandler {
     
     console.log(`   📤 Found ${worldClients.length} client(s) connected to this world`)
     
-    // Read the updated script content
-    const scriptPath = path.join(this.appsDir, appName, 'index.js')
-    const scriptContent = fs.readFileSync(scriptPath, 'utf8')
+    // Read the updated (possibly transpiled) script content
+    const scriptContent = this.readAppScriptContent(appName)
     
     // Load app config
     const app = this.loadApp(appName)
@@ -1070,12 +1098,8 @@ class HyperfyAppServerHandler {
     
     console.log(`   📤 Found ${worldClients.length} client(s) connected to this world`)
     
-    // Read the script content if it exists
-    const scriptPath = path.join(this.appsDir, appName, 'index.js')
-    let scriptContent = ''
-    if (fs.existsSync(scriptPath)) {
-      scriptContent = fs.readFileSync(scriptPath, 'utf8')
-    }
+    // Read the script content if it exists (transpile if TS)
+    let scriptContent = this.readAppScriptContent(appName)
     
     // Create deployment data from the updated blueprint
     const appData = {
@@ -1379,11 +1403,11 @@ class HyperfyAppServerHandler {
     for (const appName of appFolders) {
       try {
         const appPath = path.join(this.appsDir, appName)
-        const scriptPath = path.join(appPath, 'index.js')
+        const scriptPath = this.getAppScriptFilePath(appName)
         const linkInfo = this.getAppLinkInfo(appName)
 
         if (fs.existsSync(scriptPath)) {
-          const script = fs.readFileSync(scriptPath, 'utf8')
+          const script = this.readAppScriptContent(appName)
           
           // Get config from resolved links.json blueprint, else unlinked defaults, else minimal
           const config = linkInfo?.blueprint ? {
@@ -1597,14 +1621,14 @@ class HyperfyAppServerHandler {
 
   loadApp(appName) {
     const appPath = path.join(this.appsDir, appName)
-    const scriptPath = path.join(appPath, 'index.js')
+    const scriptPath = this.getAppScriptFilePath(appName)
 
     if (!fs.existsSync(scriptPath)) {
       return null
     }
 
     const linkInfo = this.getAppLinkInfo(appName)
-    const script = fs.readFileSync(scriptPath, 'utf8')
+    const script = this.readAppScriptContent(appName)
 
     // Get config from resolved links.json blueprint, else unlinked defaults, else minimal
     const config = linkInfo?.blueprint ? {
@@ -1637,7 +1661,7 @@ class HyperfyAppServerHandler {
     // Create app directory structure
     fs.mkdirSync(appPath, { recursive: true })
 
-    // Create index.js with provided script or default
+    // Create index.ts/js with provided script or default
     const { script, ...configData } = appData
     const scriptContent = script || `// scripts exist inside apps, which are isolated from eachother but can communicate
 // global variables: Vector3, Quaternion, Matrix4, Euler, fetch, num(min, max) (similar to Math.random)
@@ -1693,7 +1717,8 @@ app.on("update", (delta) => {
   // 'fixedUpdate' is better for physics
 });
 `
-    fs.writeFileSync(path.join(appPath, 'index.js'), scriptContent)
+    const scriptFileName = this.typescript ? 'index.ts' : 'index.js'
+    fs.writeFileSync(path.join(appPath, scriptFileName), scriptContent)
 
     // Use centralized default empty model when available and scaffold blueprint.json
     let defaultModelRelPath = null
@@ -1741,7 +1766,9 @@ app.on("update", (delta) => {
   }
 
   updateAppScript(appName, script) {
-    const scriptPath = path.join(this.appsDir, appName, 'index.js')
+    const scriptPath = this.getAppScriptFilePath(appName)
+    const folder = path.dirname(scriptPath)
+    fs.mkdirSync(folder, { recursive: true })
     fs.writeFileSync(scriptPath, script)
 
     console.log(`🔄 Updated script for: ${appName}`)
@@ -1961,7 +1988,8 @@ app.on("update", (delta) => {
           const scriptWatcher = this.fileWatchers.get(appName + '-script')
           scriptWatcher.close()
           this.fileWatchers.delete(appName + '-script')
-          console.log(`   👁️  Stopped watching ${appName}/index.js`)
+          const scriptPath = this.getAppScriptFilePath(appName)
+          console.log(`   👁️  Stopped watching ${appName}/${path.basename(scriptPath || 'index.js')}`)
         }
         
         // Stop links watcher
@@ -2181,7 +2209,12 @@ app.on("update", (delta) => {
       console.log('🛑 Stopping all file watchers...')
       for (const [appName, watcher] of this.fileWatchers.entries()) {
         watcher.close()
-        console.log(`   👁️  Stopped watching ${appName}/index.js`)
+        const scriptPath = this.getAppScriptFilePath(appName.replace(/-script$/, ''))
+        if (appName.endsWith('-script')) {
+          console.log(`   👁️  Stopped watching ${appName.replace(/-script$/, '')}/${path.basename(scriptPath || 'index.js')}`)
+        } else if (appName.endsWith('-links')) {
+          console.log(`   👁️  Stopped watching ${appName.replace(/-links$/, '')}/links.json`)
+        }
       }
       this.fileWatchers.clear()
       
@@ -2350,7 +2383,7 @@ app.on("update", (delta) => {
         // Request script content directly from client (faster, no race condition)
         try {
           const scriptContent = await this.server.requestAssetFromClient(ws, blueprint.script, 'script')
-          const targetScriptPath = path.join(appPath, 'index.js')
+          const targetScriptPath = path.join(appPath, this.typescript ? 'index.ts' : 'index.js')
           
           // Mark pending update to ignore file watcher
           this.markPendingUpdate(appName, { script: true })
@@ -2616,13 +2649,13 @@ app.on("update", (delta) => {
 
   async checkScriptHashDifference(appName, localBlueprint) {
     try {
-      const scriptPath = path.join(this.appsDir, appName, 'index.js')
+      const scriptPath = this.getAppScriptFilePath(appName)
       
       if (!fs.existsSync(scriptPath)) {
         return { isDifferent: false, reason: 'no local script file' }
       }
       
-      // Hash the actual script file
+      // Hash the actual script file content
       const actualScriptHash = hashFile(scriptPath)
       if (!actualScriptHash) {
         return { isDifferent: false, reason: 'could not hash script file' }
@@ -2845,7 +2878,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   }
   const options = {
     hotReload,
-    port: process.env.PORT || 8080
+    port: process.env.PORT || 8080,
+    typescript: argv.includes('--typescript') || argv.includes('-ts') || (typeof process.env.TYPESCRIPT !== 'undefined' && (process.env.TYPESCRIPT === 'true' || process.env.TYPESCRIPT === '1'))
   }
   main(options)
 } 

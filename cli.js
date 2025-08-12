@@ -21,7 +21,9 @@ class HyperfyCLI {
     try {
       const appPath = path.join(this.appsDir, appName)
       const configPath = path.join(appPath, 'config.json')
-      const scriptPath = path.join(appPath, 'index.js')
+      const scriptJs = path.join(appPath, 'index.js')
+      const scriptTs = path.join(appPath, 'index.ts')
+      const scriptPath = fs.existsSync(scriptJs) ? scriptJs : scriptTs
 
       // Check if app exists
       if (!fs.existsSync(appPath)) {
@@ -42,9 +44,9 @@ class HyperfyCLI {
         return
       }
 
-      // Check if index.js exists
+      // Check if script exists
       if (!fs.existsSync(scriptPath)) {
-        console.error(`❌ index.js not found for app ${appName}`)
+        console.error(`❌ index.js/ts not found for app ${appName}`)
         return
       }
 
@@ -66,18 +68,18 @@ class HyperfyCLI {
       }
       const expectedHash = scriptUrlMatch[1]
 
-      // Read index.js and calculate its hash
+      // Read script and calculate its hash
       const scriptContent = fs.readFileSync(scriptPath, 'utf8')
       const actualHash = this.calculateFileHash(scriptContent)
 
       // Compare hashes
       if (actualHash === expectedHash) {
         console.log(`✅ Script validation passed!`)
-        console.log(`📝 index.js matches the hash in config.json`)
+        console.log(`📝 ${path.basename(scriptPath)} matches the hash in config.json`)
         console.log(`🔗 Hash: ${actualHash}`)
       } else {
         console.log(`❌ Script validation failed!`)
-        console.log(`📝 index.js has been modified since last deployment`)
+        console.log(`📝 ${path.basename(scriptPath)} has been modified since last deployment`)
         console.log(`🔗 Expected: ${expectedHash}`)
         console.log(`🔗 Actual:   ${actualHash}`)
         console.log(`💡 Run 'hyperfy update ${appName}' to sync the script`)
@@ -164,7 +166,10 @@ class HyperfyCLI {
     
     try {
       if (!scriptPath) {
-        scriptPath = path.join(this.appsDir, appName, 'index.js')
+        const base = path.join(this.appsDir, appName)
+        const js = path.join(base, 'index.js')
+        const ts = path.join(base, 'index.ts')
+        scriptPath = fs.existsSync(js) ? js : ts
       }
       
       if (!fs.existsSync(scriptPath)) {

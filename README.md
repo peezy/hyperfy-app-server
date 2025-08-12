@@ -7,8 +7,9 @@ Hyperfy app development server and CLI. Spin up a local HTTP/WebSocket server to
 ### Using npx
 
 ```bash
-npx @drama.haus/app-server           # starts the server (hot reload ON by default)
-npx @drama.haus/app-server list      # runs the CLI 'list' command
+npx @drama.haus/app-server                 # starts the server (hot reload ON by default)
+npx @drama.haus/app-server --typescript    # same, prefer index.ts per-app and expose typings only (no transpile)
+npx @drama.haus/app-server list            # runs the CLI 'list' command
 ```
 
 ### Local dev
@@ -20,6 +21,8 @@ npm install
 
 # start dev server
 npm run dev
+# or TypeScript-preferred mode (no transpile; just editor hints)
+npm run dev:ts
 ```
 
 Server starts on `http://localhost:8080` and WebSocket on `ws://localhost:8080/`.
@@ -54,13 +57,33 @@ The package ships a single binary entry that dispatches to:
 - `server.js` when invoked with no positional args (or only flags)
 - `cli.js` when invoked with a positional command (e.g., `list`, `deploy`)
 
+### TypeScript typings
+
+This package ships ambient typings for the Hyperfy App runtime so you can get editor hints in your app scripts without transpiling TypeScript:
+
+- `types` export: consumers can add the package to `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "types": ["@drama.haus/app-server"]
+  }
+}
+```
+
+- Server flag `--typescript` (or `-ts`) tells the dev server to prefer `apps/<name>/index.ts` if present. The file is treated as JavaScript at runtime; the `.d.ts` only enhances IDE types.
+
 ---
 
-## Hot reload
+## Hot reload and TypeScript
 
 Hot reload is ON by default. The server watches:
 - `apps/<appName>/index.js` (script changes)
 - `apps/<appName>/links.json` (link/blueprint overrides changes)
+
+TypeScript preference (no transpile):
+- Flags: `--typescript` or `-ts` make the server prefer `index.ts` if present. The contents are treated as plain JS; `.d.ts` provides editor hints only.
+- Env: `TYPESCRIPT=true|1` enables the same behavior.
 
 Disable/enable:
 - CLI flags: `--no-hot-reload` (off), `--hot-reload` (on)
@@ -70,6 +93,8 @@ Examples:
 ```bash
 npx @drama.haus/app-server --no-hot-reload
 HOT_RELOAD=false npx @drama.haus/app-server
+npx @drama.haus/app-server --typescript
+TYPESCRIPT=1 npx @drama.haus/app-server
 ```
 
 ---
@@ -206,7 +231,8 @@ async function main() {
   const port = process.env.PORT || 8080
   const server = new HyperfyAppServer(port, {
     hotReload: true, // or use env/flags
-    fastifyOptions: { logger: false }
+    fastifyOptions: { logger: false },
+    typescript: true // optional: prefer index.ts files; no transpile, typings only
   })
 
   // Optional: subscribe to WebSocket events
